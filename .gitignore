@@ -20,3 +20,4 @@ split_manifest.json
 
 # OS
 .DS_Store
+*.bak
