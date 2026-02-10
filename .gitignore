@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Virtualenvs
+.venv/
+.venv_*/
+venv/
+env/
+
+# Outputs / datasets
+outputs/
+out/
+split/
+split_manifest.json
+*.zip
+*.tar.gz
+
+# OS
+.DS_Store

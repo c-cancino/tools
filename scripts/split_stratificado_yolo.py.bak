@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+Split estratificado para datasets YOLO con:
+- images/ en subcarpetas (escena/sub_escena/momento)
+- labels/ planos o en espejo (auto-detect por stem)
+
+Crea output con:
+out/
+  train/images/...
+  train/labels/...
+  val/images/...
+  val/labels/...
+  test/images/...
+  test/labels/...
+
+Estratifica por:
+- distribución de clases (por presencia de clase en imagen)
+- y opcionalmente por escena/momento (para que no te quede un split solo de "noche", etc.)
+
+No requiere sklearn.
+Heurística greedy balanceando "coste" (desviación) por clase y por grupo.
+"""
+
+import argparse
+import json
+import math
+import os
+import random
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+@dataclass
+class Sample:
+    stem: str
+    img_path: Path
+    lbl_path: Path
+    rel_img: Path          # relativo a images/
+    escena: str
+    subescena: str
+    momento: str
+    classes: Set[int]      # clases presentes en la imagen
+
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", required=True, help="Dataset fuente con images/ y labels/")
+    ap.add_argument("--out", required=True, help="Carpeta salida del split")
+    ap.add_argument("--train", type=float, default=0.8)
+    ap.add_argument("--val", type=float, default=0.1)
+    ap.add_argument("--test", type=float, default=0.1)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--keep-structure", action="store_true",
+                    help="Mantener subcarpetas de imágenes dentro de cada split (recomendado).")
+    ap.add_argument("--labels-flat", action="store_true",
+                    help="Forzar labels planos (labels/*.txt). Si no, intenta espejo por ruta.")
+    ap.add_argument("--min-instances", type=int, default=1,
+                    help="Si una imagen queda sin instancias (label vacío), se excluye por defecto.")
+    ap.add_argument("--group-keys", default="escena,momento",
+                    help="Claves de grupo para balancear además de clases. Opciones: escena,subescena,momento. Ej: 'escena,momento' o ''")
+    ap.add_argument("--max-classes", type=int, default=10_000,
+                    help="Límite por seguridad si hay labels raros.")
+    ap.add_argument("--dry", action="store_true", help="No copia archivos, solo genera split.json")
+    return ap.parse_args()
+
+def safe_norm(x: float) -> float:
+    return 0.0 if abs(x) < 1e-12 else x
+
+def build_image_index(images_dir: Path) -> Dict[str, Path]:
+    idx = {}
+    for p in images_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in IMG_EXTS:
+            # si hay duplicados por stem, nos quedamos con el primero (igual lo reportamos luego)
+            idx.setdefault(p.stem, p)
+    return idx
+
+def extract_meta_from_rel(rel: Path) -> Tuple[str, str, str]:
+    # rel = escena_X/sub_escena_Y/momento/file.jpg
+    parts = rel.parts
+    escena = parts[0] if len(parts) >= 1 else "unknown_escena"
+    subescena = parts[1] if len(parts) >= 2 else "unknown_subescena"
+    momento = parts[2] if len(parts) >= 3 else "unknown_momento"
+    return escena, subescena, momento
+
+def read_classes(lbl_path: Path, max_classes: int) -> Tuple[Set[int], int]:
+    classes = set()
+    n = 0
+    txt = lbl_path.read_text().splitlines()
+    for ln in txt:
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        try:
+            c = int(float(parts[0]))
+        except:
+            continue
+        if c < 0 or c > max_classes:
+            continue
+        classes.add(c)
+        n += 1
+    return classes, n
+
+def resolve_label_path(labels_dir: Path, images_dir: Path, img_path: Path, labels_flat: bool) -> Optional[Path]:
+    if labels_flat:
+        cand = labels_dir / f"{img_path.stem}.txt"
+        return cand if cand.exists() else None
+
+    # intento espejo por ruta relativa
+    rel = img_path.relative_to(images_dir)
+    cand = labels_dir / rel.with_suffix(".txt")
+    if cand.exists():
+        return cand
+
+    # fallback a plano
+    cand2 = labels_dir / f"{img_path.stem}.txt"
+    if cand2.exists():
+        return cand2
+
+    return None
+
+def load_samples(src: Path, labels_flat: bool, min_instances: int, max_classes: int) -> List[Sample]:
+    images_dir = src / "images"
+    labels_dir = src / "labels"
+    if not images_dir.exists() or not labels_dir.exists():
+        raise SystemExit("src debe tener images/ y labels/")
+
+    img_idx = build_image_index(images_dir)
+
+    # si labels son planos, recorremos labels; si no, recorremos imágenes (más general).
+    samples: List[Sample] = []
+    missing = 0
+    empty = 0
+    dups = 0
+
+    # detectar duplicados por stem
+    stem_counts = {}
+    for p in images_dir.rglob("*"):
+        if p.is_file() and p.suffix.lower() in IMG_EXTS:
+            stem_counts[p.stem] = stem_counts.get(p.stem, 0) + 1
+    dups = sum(1 for k,v in stem_counts.items() if v > 1)
+
+    # recorrer imágenes (más robusto)
+    img_files = [p for p in images_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS]
+    for img in img_files:
+        lbl = resolve_label_path(labels_dir, images_dir, img, labels_flat=labels_flat)
+        if lbl is None:
+            missing += 1
+            continue
+        classes, n_inst = read_classes(lbl, max_classes=max_classes)
+        if n_inst < min_instances:
+            empty += 1
+            continue
+        rel = img.relative_to(images_dir)
+        escena, subescena, momento = extract_meta_from_rel(rel)
+        samples.append(Sample(
+            stem=img.stem,
+            img_path=img,
+            lbl_path=lbl,
+            rel_img=rel,
+            escena=escena,
+            subescena=subescena,
+            momento=momento,
+            classes=classes,
+        ))
+
+    print(f"Samples cargados: {len(samples)}")
+    print(f"Imágenes sin label: {missing}")
+    print(f"Imágenes excluidas por instancias<{min_instances}: {empty}")
+    if dups > 0:
+        print(f"AVISO: stems duplicados en images/: {dups} (puede afectar matches si labels son planos).")
+    return samples
+
+def build_totals(samples: List[Sample]) -> Tuple[Dict[int,int], Dict[str,int]]:
+    class_tot = {}
+    for s in samples:
+        for c in s.classes:
+            class_tot[c] = class_tot.get(c, 0) + 1
+    return class_tot
+
+def make_group_key(s: Sample, keys: List[str]) -> str:
+    parts = []
+    for k in keys:
+        if k == "escena":
+            parts.append(s.escena)
+        elif k == "subescena":
+            parts.append(s.subescena)
+        elif k == "momento":
+            parts.append(s.momento)
+    return "|".join(parts) if parts else "all"
+
+def greedy_stratified_split(
+    samples: List[Sample],
+    ratios: Dict[str,float],
+    group_keys: List[str],
+    seed: int
+) -> Dict[str, List[Sample]]:
+    random.seed(seed)
+
+    # objetivos de tamaño por split
+    n = len(samples)
+    targets_n = {k: int(round(v*n)) for k,v in ratios.items()}
+    # ajuste para que sumen n
+    diff = n - sum(targets_n.values())
+    # reparte diff al train
+    if diff != 0:
+        targets_n["train"] = targets_n.get("train",0) + diff
+
+    splits = {k: [] for k in ratios.keys()}
+    split_counts_n = {k: 0 for k in ratios.keys()}
+
+    # objetivos por clase (presencia)
+    class_tot = {}
+    for s in samples:
+        for c in s.classes:
+            class_tot[c] = class_tot.get(c, 0) + 1
+
+    target_class = {sp: {} for sp in ratios.keys()}
+    for sp, r in ratios.items():
+        for c, tot in class_tot.items():
+            target_class[sp][c] = r * tot
+
+    # objetivos por grupo (escena/momento)
+    group_tot = {}
+    for s in samples:
+        g = make_group_key(s, group_keys)
+        group_tot[g] = group_tot.get(g, 0) + 1
+
+    target_group = {sp: {} for sp in ratios.keys()}
+    for sp, r in ratios.items():
+        for g, tot in group_tot.items():
+            target_group[sp][g] = r * tot
+
+    # contadores actuales
+    cur_class = {sp: {} for sp in ratios.keys()}
+    cur_group = {sp: {} for sp in ratios.keys()}
+
+    # orden: primero imágenes con clases raras (mejora balance)
+    def rarity_score(s: Sample) -> float:
+        # menor total => más raro => score más alto
+        sc = 0.0
+        for c in s.classes:
+            sc += 1.0 / max(1, class_tot.get(c, 1))
+        return -sc  # negativo para ordenar ascendente
+    ordered = sorted(samples, key=rarity_score)
+
+    # función de costo: desviación cuadrática de clase+grupo + penalización por tamaño
+    def cost_if_assign(sp: str, s: Sample) -> float:
+        # penaliza si ya llenó el cupo
+        if split_counts_n[sp] >= targets_n[sp]:
+            return 1e9
+
+        g = make_group_key(s, group_keys)
+
+        cost = 0.0
+        # clases
+        for c in s.classes:
+            cur = cur_class[sp].get(c, 0.0)
+            tgt = target_class[sp].get(c, 0.0)
+            # after
+            after = cur + 1.0
+            cost += (after - tgt) ** 2 - (cur - tgt) ** 2
+
+        # grupos
+        curg = cur_group[sp].get(g, 0.0)
+        tgtg = target_group[sp].get(g, 0.0)
+        afterg = curg + 1.0
+        cost += (afterg - tgtg) ** 2 - (curg - tgtg) ** 2
+
+        # tamaño total
+        curN = split_counts_n[sp]
+        tgtN = targets_n[sp]
+        cost += 0.5 * ((curN + 1 - tgtN) ** 2 - (curN - tgtN) ** 2)
+
+        return cost
+
+    for s in ordered:
+        # elige split con menor costo
+        best_sp = None
+        best_cost = None
+        for sp in ratios.keys():
+            c = cost_if_assign(sp, s)
+            if best_cost is None or c < best_cost:
+                best_cost = c
+                best_sp = sp
+
+        assert best_sp is not None
+        splits[best_sp].append(s)
+        split_counts_n[best_sp] += 1
+
+        g = make_group_key(s, group_keys)
+        cur_group[best_sp][g] = cur_group[best_sp].get(g, 0.0) + 1.0
+        for cls in s.classes:
+            cur_class[best_sp][cls] = cur_class[best_sp].get(cls, 0.0) + 1.0
+
+    # shuffle interno para que no quede ordenado raro
+    for sp in splits:
+        random.shuffle(splits[sp])
+
+    return splits
+
+def export_split(out: Path, src: Path, splits: Dict[str, List[Sample]], keep_structure: bool, dry: bool):
+    images_dir = src / "images"
+
+    manifest = {"splits": {}}
+
+    for sp, items in splits.items():
+        manifest["splits"][sp] = []
+        out_img = out / sp / "images"
+        out_lbl = out / sp / "labels"
+        if not dry:
+            out_img.mkdir(parents=True, exist_ok=True)
+            out_lbl.mkdir(parents=True, exist_ok=True)
+
+        for s in items:
+            # imagen
+            if keep_structure:
+                rel_img = s.img_path.relative_to(images_dir)
+                dst_img = out_img / rel_img
+            else:
+                dst_img = out_img / s.img_path.name
+
+            # label (mantengo plano por nombre)
+            dst_lbl = out_lbl / f"{s.stem}.txt"
+
+            manifest["splits"][sp].append({
+                "stem": s.stem,
+                "img": str(s.img_path),
+                "lbl": str(s.lbl_path),
+                "escena": s.escena,
+                "subescena": s.subescena,
+                "momento": s.momento,
+                "classes": sorted(list(s.classes)),
+                "dst_img": str(dst_img),
+                "dst_lbl": str(dst_lbl),
+            })
+
+            if not dry:
+                dst_img.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(s.img_path, dst_img)
+                shutil.copy2(s.lbl_path, dst_lbl)
+
+    (out / "split_manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+
+def main():
+    args = parse_args()
+    src = Path(args.src)
+    out = Path(args.out)
+
+    # ratios sanity
+    rsum = args.train + args.val + args.test
+    if abs(rsum - 1.0) > 1e-6:
+        raise SystemExit("train+val+test debe sumar 1.0")
+
+    ratios = {"train": args.train, "val": args.val, "test": args.test}
+
+    group_keys = [k.strip() for k in args.group_keys.split(",") if k.strip()] if args.group_keys.strip() else []
+    for k in group_keys:
+        if k not in {"escena", "subescena", "momento"}:
+            raise SystemExit(f"group-keys inválido: {k}")
+
+    samples = load_samples(src, labels_flat=args.labels_flat, min_instances=args.min_instances, max_classes=args.max_classes)
+    if len(samples) == 0:
+        raise SystemExit("No hay samples válidos. Revisa rutas o min-instances.")
+
+    splits = greedy_stratified_split(samples, ratios, group_keys=group_keys, seed=args.seed)
+
+    # resumen
+    print("\n=== Resumen split ===")
+    for sp, items in splits.items():
+        print(f"{sp}: {len(items)}")
+
+    out.mkdir(parents=True, exist_ok=True)
+    export_split(out, src, splits, keep_structure=args.keep_structure, dry=args.dry)
+    print(f"\nListo. Manifest: {out}/split_manifest.json")
+    if args.dry:
+        print("DRY RUN: no se copiaron archivos.")
+
+if __name__ == "__main__":
+    main()
